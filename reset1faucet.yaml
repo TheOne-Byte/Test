@@ -1,0 +1,52 @@
+version: 2
+
+include:
+  - acls.yaml
+
+vlans:
+  office:
+    vid: 100
+
+acls:
+  allow_server: {}
+
+dps:
+  sw1:
+    dp_id: 0x1
+    interfaces:
+      1:
+        native_vlan: office
+        acls_in: [allow_server]   # h1
+      2:
+        native_vlan: office
+  sw2:
+    dp_id: 0x2
+    interfaces:
+      1:
+        native_vlan: office
+        acls_in: [allow_server]   # h2
+      2:
+        native_vlan: office
+  sw3:
+    dp_id: 0x3
+    interfaces:
+      1:
+        native_vlan: office
+      2:
+        native_vlan: office
+  sw4:
+    dp_id: 0x4
+    interfaces:
+      1:
+        native_vlan: office
+      2:
+        native_vlan: office
+  sw5:
+    dp_id: 0x5
+    interfaces:
+      1:
+        native_vlan: office
+        acls_in: [allow_server]   # mgmt
+      2:
+        native_vlan: office
+        acls_in: [allow_server]   # server
