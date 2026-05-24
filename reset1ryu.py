@@ -29,6 +29,7 @@ class EnterpriseSDN(app_manager.RyuApp):
         self.sw5_dp = None 
         self.mac_to_port = {}
         self.monitor_thread = hub.spawn(self._monitor) 
+        # Instantiating cleaner output capture document for B2 metrics
         with open('sw5_stats.csv', 'w', newline='') as f: 
             csv.writer(f).writerow(['timestamp', 'flow_match', 'byte_count', 'packet_count']) 
 
@@ -132,6 +133,18 @@ class EnterpriseSDN(app_manager.RyuApp):
         with open('sw5_stats.csv', 'a', newline='') as f: 
             writer = csv.writer(f) 
             for stat in ev.msg.body: 
-                match = stat.match 
-                if 'ipv4_src' not in match: continue 
-                writer.writerow([time.strftime('%Y-%m-%d %H:%M:%S'), f"src:{match['ipv4_src']}->dst:{match['ipv4_dst']}", stat.byte_count, stat.packet_count])
+                # Parse internal rule matches safely
+                match_fields = dict(stat.match.items())
+                
+                # Format a scannable structural description
+                match_desc = []
+                if 'eth_src' in match_fields: match_desc.append(f"src_mac:{match_fields['eth_src']}")
+                if 'eth_dst' in match_fields: match_desc.append(f"dst_mac:{match_fields['eth_dst']}")
+                if 'ipv4_src' in match_fields: match_desc.append(f"src_ip:{match_fields['ipv4_src']}")
+                if 'ipv4_dst' in match_fields: match_desc.append(f"dst_ip:{match_fields['ipv4_dst']}")
+                
+                if not match_desc: 
+                    match_desc = [f"Priority:{stat.priority}_Default_Rule"]
+                
+                label = " | ".join(match_desc)
+                writer.writerow([time.strftime('%Y-%m-%d %H:%M:%S'), label, stat.byte_count, stat.packet_count])
