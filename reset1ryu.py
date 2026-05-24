@@ -27,8 +27,8 @@ class EnterpriseSDN(app_manager.RyuApp):
     def __init__(self, *args, **kwargs): 
         super(EnterpriseSDN, self).__init__(*args, **kwargs) 
         self.sw5_dp = None 
+        self.mac_to_port = {}
         self.monitor_thread = hub.spawn(self._monitor) 
-        # Instantiating cleaner output capture document for B2 metrics
         with open('sw5_stats.csv', 'w', newline='') as f: 
             csv.writer(f).writerow(['timestamp', 'flow_match', 'byte_count', 'packet_count']) 
 
@@ -55,69 +55,71 @@ class EnterpriseSDN(app_manager.RyuApp):
         parser = dp.ofproto_parser 
         dpid = dp.id 
 
-        flood = [parser.OFPActionOutput(ofp.OFPP_FLOOD)] 
+        # 1. Provide an absolute fallback for ARP discovery
+        self.add_flow(dp, 100, parser.OFPMatch(eth_type=0x0806), [parser.OFPActionOutput(ofp.OFPP_FLOOD)])
 
-        # High-priority globally transparent fallback for infrastructure ARP tracking
-        self.add_flow(dp, 100, parser.OFPMatch(eth_type=0x0806), flood)
+        # 2. Add dynamic Packet-In handler rule so switches can discover host ports natively
+        self.add_flow(dp, 0, parser.OFPMatch(), [parser.OFPActionOutput(ofp.OFPP_CONTROLLER)])
 
-        # --- SW1 Gateway Interface --- 
-        if dpid == 1: 
-            for proto in [6, 17, 1]: # Proactive layer 4 verification vectors
-                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_dst=SERVER_IP), [parser.OFPActionOutput(2)])
-                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_src=SERVER_IP, ipv4_dst=H1_IP), [parser.OFPActionOutput(1)])
-            # Part B1 Perimeter Lock down
-            self.add_flow(dp, 5, parser.OFPMatch(eth_type=0x0800), [])
-
-        # --- SW2 Gateway Interface --- 
-        elif dpid == 2: 
-            for proto in [6, 17, 1]:
-                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_dst=SERVER_IP), [parser.OFPActionOutput(2)])
-                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_src=SERVER_IP, ipv4_dst=H2_IP), [parser.OFPActionOutput(1)])
-            self.add_flow(dp, 5, parser.OFPMatch(eth_type=0x0800), [])
-
-        # --- SW3 Core Matrix --- 
-        elif dpid == 3: 
-            for proto in [6, 17, 1]:
-                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_dst=SERVER_IP), [parser.OFPActionOutput(3)])
-                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_src=SERVER_IP, ipv4_dst=H1_IP), [parser.OFPActionOutput(1)])
-                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_src=SERVER_IP, ipv4_dst=H2_IP), [parser.OFPActionOutput(2)])
-            self.add_flow(dp, 5, parser.OFPMatch(eth_type=0x0800), [])
-
-        # --- SW4 Core Matrix --- 
-        elif dpid == 4: 
-            for proto in [6, 17, 1]:
-                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_dst=SERVER_IP), [parser.OFPActionOutput(3)])
-                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_src=SERVER_IP, ipv4_dst=H1_IP), [parser.OFPActionOutput(1)])
-                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_src=SERVER_IP, ipv4_dst=H2_IP), [parser.OFPActionOutput(2)])
-            self.add_flow(dp, 5, parser.OFPMatch(eth_type=0x0800), [])
-
-        # --- SW5 Core Data Center Aggregator --- 
-        elif dpid == 5: 
-            self.sw5_dp = dp 
-            # Implement 5 Mbps hard limiting rate band for sub-task B4
+        # 3. Provision the sub-task B4 rate limiter band on the core switch
+        if dpid == SW5_DPID:
+            self.sw5_dp = dp
             self.add_meter(dp, meter_id=1, rate_kbps=5000)
 
-            host_routing_table = [(H1_IP, 3), (H2_IP, 3), (MGMT_IP, 1)]
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    def _packet_in_handler(self, ev):
+        msg = ev.msg
+        dp = msg.datapath
+        ofp = dp.ofproto
+        parser = dp.ofproto_parser
+        in_port = msg.match['in_port']
 
-            for host_ip, host_port in host_routing_table:
-                for proto in [6, 17, 1]: 
-                    if proto == 17:  # intercept UDP packets and push into the pipeline meter table
-                        self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_src=host_ip, ipv4_dst=SERVER_IP), [parser.OFPActionOutput(2)], meter_id=1)
-                        self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_src=SERVER_IP, ipv4_dst=host_ip), [parser.OFPActionOutput(host_port)], meter_id=1)
-                    else:            # TCP and ICMP route natively through clean pipes
-                        self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_src=host_ip, ipv4_dst=SERVER_IP), [parser.OFPActionOutput(2)])
-                        self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_src=SERVER_IP, ipv4_dst=host_ip), [parser.OFPActionOutput(host_port)])
+        # Parse ethernet frames to locate MAC endpoints safely
+        from ryu.lib.packet import packet, ethernet, ipv4
+        pkt = packet.Packet(msg.data)
+        eth = pkt.get_protocols(ethernet.ethernet)[0]
+        
+        dst = eth.dst
+        src = eth.src
+        dpid = dp.id
 
-            # Isolation drop filter for non-server IP packets crossing core switch space
-            self.add_flow(dp, 5, parser.OFPMatch(eth_type=0x0800), []) 
+        self.mac_to_port.setdefault(dpid, {})
+        self.mac_to_port[dpid][src] = in_port
 
-            # Hardcoded L2 destination overrides for switch fabric structural safety
-            self.add_flow(dp, 3, parser.OFPMatch(eth_dst=SERVER_MAC), [parser.OFPActionOutput(2)]) 
-            self.add_flow(dp, 3, parser.OFPMatch(eth_dst=MGMT_MAC),   [parser.OFPActionOutput(1)]) 
-            self.add_flow(dp, 3, parser.OFPMatch(eth_dst=H1_MAC),     [parser.OFPActionOutput(3)]) 
-            self.add_flow(dp, 3, parser.OFPMatch(eth_dst=H2_MAC),     [parser.OFPActionOutput(3)]) 
+        # Part B1 Perimeter Lockdown: If it's IP traffic, strictly enforce Server-Only routing
+        _ipv4 = pkt.get_protocol(ipv4.ipv4)
+        if _ipv4:
+            src_ip = _ipv4.src
+            dst_ip = _ipv4.dst
+            
+            # If traffic isn't heading to or coming from the Server, drop it immediately!
+            if dst_ip != SERVER_IP and src_ip != SERVER_IP:
+                self.add_flow(dp, 5, parser.OFPMatch(eth_type=0x0800, ipv4_src=src_ip, ipv4_dst=dst_ip), [])
+                return
 
-    # --- B2 Performance Polling Loops ---
+        # If we know where the destination MAC is, write a permanent flow rule
+        if dst in self.mac_to_port[dpid]:
+            out_port = self.mac_to_port[dpid][dst]
+            actions = [parser.OFPActionOutput(out_port)]
+            
+            # Apply traffic engineering limits to UDP streams crossing sw5
+            if dpid == SW5_DPID and _ipv4 and _ipv4.proto == 17:
+                match = parser.OFPMatch(eth_type=0x0800, ipv4_src=_ipv4.src, ipv4_dst=_ipv4.dst)
+                self.add_flow(dp, 10, match, actions, meter_id=1)
+            else:
+                match = parser.OFPMatch(eth_dst=dst)
+                self.add_flow(dp, 10, match, actions)
+
+            # Send the current packet out
+            out = parser.OFPPacketOut(datapath=dp, buffer_id=msg.buffer_id, in_port=in_port, actions=actions, data=msg.data)
+            dp.send_msg(out)
+        else:
+            # If we don't know where it is yet, flood it safely to discover it
+            actions = [parser.OFPActionOutput(ofp.OFPP_FLOOD)]
+            out = parser.OFPPacketOut(datapath=dp, buffer_id=msg.buffer_id, in_port=in_port, actions=actions, data=msg.data)
+            dp.send_msg(out)
+
+    # --- B2/B3 Performance Monitoring Engine ---
     def _monitor(self): 
         while True: 
             if self.sw5_dp is not None: 
@@ -131,8 +133,5 @@ class EnterpriseSDN(app_manager.RyuApp):
             writer = csv.writer(f) 
             for stat in ev.msg.body: 
                 match = stat.match 
-                if 'ip_proto' not in match: continue 
-                proto = match['ip_proto'] 
-                if proto not in (6, 17): continue 
-                label = 'TCP' if proto == 6 else 'UDP' 
-                writer.writerow([time.strftime('%Y-%m-%d %H:%M:%S'), label, stat.byte_count, stat.packet_count])
+                if 'ipv4_src' not in match: continue 
+                writer.writerow([time.strftime('%Y-%m-%d %H:%M:%S'), f"src:{match['ipv4_src']}->dst:{match['ipv4_dst']}", stat.byte_count, stat.packet_count])
