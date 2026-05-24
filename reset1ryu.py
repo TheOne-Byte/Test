@@ -1,61 +1,220 @@
-acls:
-    allow_server:
+from ryu.base import app_manager 
+from ryu.controller import ofp_event 
+from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls 
+from ryu.ofproto import ofproto_v1_3 
+from ryu.lib import hub 
+import csv 
+import time 
 
-        # h1 -> server
-        - rule:
-            dl_type: 0x0800
-            ip_proto: 6
-            ipv4_src: 10.0.0.1
-            ipv4_dst: 10.0.0.11
-            actions:
-                allow: 1
+SW5_DPID = 5 
 
-        # server -> h1
-        - rule:
-            dl_type: 0x0800
-            ip_proto: 6
-            ipv4_src: 10.0.0.11
-            ipv4_dst: 10.0.0.1
-            actions:
-                allow: 1
+# Standardized Physical Ports derived from network layout: 
+# sw1: eth1=h1, eth2=sw3, eth3=sw4 
+# sw2: eth1=h2, eth2=sw3, eth3=sw4 
+# sw3: eth1=sw1, eth2=sw2, eth3=sw5 
+# sw4: eth1=sw1, eth2=sw2, eth3=sw5 
+# sw5: eth1=mgmt, eth2=server, eth3=sw3, eth4=sw4 
 
-        # h2 -> server
-        - rule:
-            dl_type: 0x0800
-            ip_proto: 6
-            ipv4_src: 10.0.0.2
-            ipv4_dst: 10.0.0.11
-            actions:
-                allow: 1
+# Hardware MAC Addresses
+H1_MAC     = '00:00:00:00:00:01' 
+H2_MAC     = '00:00:00:00:00:02' 
+MGMT_MAC   = '00:00:00:00:00:03' 
+SERVER_MAC = '00:00:00:00:00:04' 
 
-        # server -> h2
-        - rule:
-            dl_type: 0x0800
-            ip_proto: 6
-            ipv4_src: 10.0.0.11
-            ipv4_dst: 10.0.0.2
-            actions:
-                allow: 1
+# Network Layer IP Mapping
+SERVER_IP = '10.0.0.11' 
+H1_IP     = '10.0.0.1' 
+H2_IP     = '10.0.0.2' 
+MGMT_IP   = '10.0.0.254' 
 
-        # mgmt -> server
-        - rule:
-            dl_type: 0x0800
-            ip_proto: 6
-            ipv4_src: 10.0.0.254
-            ipv4_dst: 10.0.0.11
-            actions:
-                allow: 1
 
-        # server -> mgmt
-        - rule:
-            dl_type: 0x0800
-            ip_proto: 6
-            ipv4_src: 10.0.0.11
-            ipv4_dst: 10.0.0.254
-            actions:
-                allow: 1
+class EnterpriseSDN(app_manager.RyuApp): 
+    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION] 
 
-        # DROP EVERYTHING ELSE
-        - rule:
-            actions:
-                drop: 1
+    def __init__(self, *args, **kwargs): 
+        super(EnterpriseSDN, self).__init__(*args, **kwargs) 
+        self.sw5_dp = None 
+        self.monitor_thread = hub.spawn(self._monitor) 
+        # Create or truncate stats file with header rows
+        with open('sw5_stats.csv', 'w', newline='') as f: 
+            csv.writer(f).writerow(['timestamp', 'flow_match', 'byte_count', 'packet_count']) 
+
+    def add_flow(self, dp, priority, match, actions, meter_id=None): 
+        ofp = dp.ofproto 
+        parser = dp.ofproto_parser 
+        
+        # Build standard output instruction pipeline
+        inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)] 
+        
+        # Inject meter instruction into pipeline if specified
+        if meter_id is not None:
+            inst.append(parser.OFPInstructionMeter(meter_id, ofp.OFPIT_METER))
+            
+        mod = parser.OFPFlowMod(datapath=dp, priority=priority, 
+                                match=match, instructions=inst) 
+        dp.send_msg(mod) 
+
+    def add_meter(self, dp, meter_id, rate_kbps):
+        ofp = dp.ofproto
+        parser = dp.ofproto_parser
+        
+        # Define a hard band that drops packets exceeding the rate threshold
+        bands = [parser.OFPMeterBandDrop(rate=rate_kbps, burst_size=0)]
+        
+        mod = parser.OFPMeterMod(
+            datapath=dp, 
+            command=ofp.OFPMC_ADD,
+            flags=ofp.OFPMF_KBPS, # Scale limits in kbps
+            meter_id=meter_id,
+            bands=bands
+        )
+        dp.send_msg(mod)
+
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER) 
+    def switch_features_handler(self, ev): 
+        dp = ev.msg.datapath 
+        ofp = dp.ofproto 
+        parser = dp.ofproto_parser 
+        dpid = dp.id 
+
+        if dpid == SW5_DPID: 
+            self.sw5_dp = dp 
+
+        # Broadcast fallback token for network initialization 
+        flood = [parser.OFPActionOutput(ofp.OFPP_FLOOD)] 
+
+        # ==========================================
+        # --- SW1 (Edge: Host 1 Gateway Link) ---
+        # ==========================================
+        if dpid == 1: 
+            self.add_flow(dp, 1, parser.OFPMatch(eth_type=0x0806), flood) # Permit ARP Resolution
+            
+            for proto in [6, 17, 1]: # Proactively map Layer 4 (6=TCP, 17=UDP, 1=ICMP)
+                # Client-to-Server Uplink: Out via port 2 to sw3
+                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_dst=SERVER_IP), [parser.OFPActionOutput(2)])
+                # Server-to-Client Downlink: Out via port 1 to h1
+                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_src=SERVER_IP, ipv4_dst=H1_IP), [parser.OFPActionOutput(1)])
+            
+            # Sub-task B1 Security Enforcement: Proactively drop isolated internal host-to-host streams
+            self.add_flow(dp, 5, parser.OFPMatch(eth_type=0x0800), [])
+
+        # ==========================================
+        # --- SW2 (Edge: Host 2 Gateway Link) ---
+        # ==========================================
+        elif dpid == 2: 
+            self.add_flow(dp, 1, parser.OFPMatch(eth_type=0x0806), flood) 
+            
+            for proto in [6, 17, 1]:
+                # Client-to-Server Uplink: Out via port 2 to sw3
+                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_dst=SERVER_IP), [parser.OFPActionOutput(2)])
+                # Server-to-Client Downlink: Out via port 1 to h2
+                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_src=SERVER_IP, ipv4_dst=H2_IP), [parser.OFPActionOutput(1)])
+            
+            # Sub-task B1 Security Enforcement: Proactively drop isolated internal host-to-host streams
+            self.add_flow(dp, 5, parser.OFPMatch(eth_type=0x0800), [])
+
+        # ==========================================
+        # --- SW3 (Distribution Layer Switch) ---
+        # ==========================================
+        elif dpid == 3: 
+            self.add_flow(dp, 1, parser.OFPMatch(eth_type=0x0806), flood) 
+            
+            for proto in [6, 17, 1]:
+                # All Server-bound traffic crosses Port 3 up to sw5
+                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_dst=SERVER_IP), [parser.OFPActionOutput(3)])
+                # Return flows forwarded down to respective edge switch interfaces
+                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_src=SERVER_IP, ipv4_dst=H1_IP), [parser.OFPActionOutput(1)])
+                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_src=SERVER_IP, ipv4_dst=H2_IP), [parser.OFPActionOutput(2)])
+            
+            # Prevent lateral core shortcuts bypassing policy restrictions
+            self.add_flow(dp, 5, parser.OFPMatch(eth_type=0x0800), [])
+
+        # ==========================================
+        # --- SW4 (Redundant Distribution Path) ---
+        # ==========================================
+        elif dpid == 4: 
+            self.add_flow(dp, 1, parser.OFPMatch(eth_type=0x0806), flood) 
+            
+            for proto in [6, 17, 1]:
+                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_dst=SERVER_IP), [parser.OFPActionOutput(3)])
+                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_src=SERVER_IP, ipv4_dst=H1_IP), [parser.OFPActionOutput(1)])
+                self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_src=SERVER_IP, ipv4_dst=H2_IP), [parser.OFPActionOutput(2)])
+            
+            self.add_flow(dp, 5, parser.OFPMatch(eth_type=0x0800), [])
+
+        # ==========================================
+        # --- SW5 (Core & Data Center Switch) ---
+        # ==========================================
+        elif dpid == 5: 
+            self.sw5_dp = dp 
+            self.add_flow(dp, 1, parser.OFPMatch(eth_type=0x0806), flood) 
+
+            # Sub-task B4 Implementation: Provision a 5 Mbps (5000 kbps) Traffic Engineering Meter
+            self.add_meter(dp, meter_id=1, rate_kbps=5000)
+
+            # Interface lookup database for incoming connections 
+            host_routing_table = [
+                (H1_IP, 3),   # Reached via distribution switch link
+                (H2_IP, 3),   # Reached via distribution switch link
+                (MGMT_IP, 1)  # Directly wired on Local Port 1
+            ]
+
+            for host_ip, host_port in host_routing_table:
+                for proto in [6, 17, 1]: 
+                    
+                    # Traffic directed TO the Server (Port 2)
+                    if proto == 17:  # Intercept UDP and bind to Meter Table Entry 1
+                        self.add_flow(dp, 10, 
+                                      parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_src=host_ip, ipv4_dst=SERVER_IP), 
+                                      [parser.OFPActionOutput(2)], meter_id=1)
+                    else:            # TCP and ICMP flows bypass metering
+                        self.add_flow(dp, 10, 
+                                      parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_src=host_ip, ipv4_dst=SERVER_IP), 
+                                      [parser.OFPActionOutput(2)])
+                    
+                    # Traffic traveling FROM the Server back out to hosts
+                    if proto == 17:  # Enforce downstream traffic engineering policy on UDP
+                        self.add_flow(dp, 10, 
+                                      parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_src=SERVER_IP, ipv4_dst=host_ip), 
+                                      [parser.OFPActionOutput(host_port)], meter_id=1)
+                    else:
+                        self.add_flow(dp, 10, 
+                                      parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_src=SERVER_IP, ipv4_dst=host_ip), 
+                                      [parser.OFPActionOutput(host_port)])
+
+            # Explicit Drop for malicious or unmapped local data plane configurations
+            self.add_flow(dp, 5, parser.OFPMatch(eth_type=0x0800), []) 
+
+            # Hardcoded Layer 2 Fallback vectors for structural integrity
+            self.add_flow(dp, 3, parser.OFPMatch(eth_dst=SERVER_MAC), [parser.OFPActionOutput(2)]) 
+            self.add_flow(dp, 3, parser.OFPMatch(eth_dst=MGMT_MAC),   [parser.OFPActionOutput(1)]) 
+            self.add_flow(dp, 3, parser.OFPMatch(eth_dst=H1_MAC),     [parser.OFPActionOutput(3)]) 
+            self.add_flow(dp, 3, parser.OFPMatch(eth_dst=H2_MAC),     [parser.OFPActionOutput(3)]) 
+
+    # ==========================================
+    # --- B2 Traffic Polling Engine ---
+    # ==========================================
+    def _monitor(self): 
+        while True: 
+            if self.sw5_dp is not None: 
+                # Dispatch regular stats collection request packet to Core Switch
+                self.sw5_dp.send_msg( 
+                    self.sw5_dp.ofproto_parser.OFPFlowStatsRequest(self.sw5_dp)) 
+            hub.sleep(10) # 10-second polling cycle interval
+
+    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER) 
+    def flow_stats_reply_handler(self, ev): 
+        if ev.msg.datapath.id != SW5_DPID: 
+            return 
+        with open('sw5_stats.csv', 'a', newline='') as f: 
+            writer = csv.writer(f) 
+            for stat in ev.msg.body: 
+                match = stat.match 
+                if 'ip_proto' not in match: 
+                    continue 
+                proto = match['ip_proto'] 
+                if proto not in (6, 17): 
+                    continue 
+                label = 'TCP' if proto == 6 else 'UDP' 
+                # Record performance dataset row
+                writer.writerow([time.time(), label, stat.byte_count, stat.packet_count])
