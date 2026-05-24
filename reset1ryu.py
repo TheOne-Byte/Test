@@ -1,4 +1,4 @@
-acls:
+acls:a
   allow_server:
     # h1 -> server
     - rule:
