@@ -12,7 +12,6 @@ H1_IP = '10.0.0.1'
 H2_IP = '10.0.0.2'
 MGMT_IP = '10.0.0.254'
 
-# dpid of sw5 (must match Mininet)
 SW5_DPID = 5
 
 
@@ -24,42 +23,39 @@ class EnterpriseSDN(app_manager.RyuApp):
         self.datapaths = {}
         self.monitor_thread = hub.spawn(self._monitor)
 
-        # CSV file for stats
         self.csv_file = open('sw5_stats.csv', 'w', newline='')
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow(['timestamp', 'dpid', 'match', 'byte_count', 'packet_count'])
 
+    # Register datapaths
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, CONFIG_DISPATCHER])
     def _state_change_handler(self, ev):
-        datapath = ev.datapath
+        dp = ev.datapath
         if ev.state == MAIN_DISPATCHER:
-            if datapath.id not in self.datapaths:
-                self.logger.info('Register datapath: %016x', datapath.id)
-                self.datapaths[datapath.id] = datapath
+            self.datapaths[dp.id] = dp
+            self.logger.info("Register datapath: %016x", dp.id)
         elif ev.state == ofproto_v1_3.OFPPR_DELETE:
-            if datapath.id in self.datapaths:
-                self.logger.info('Unregister datapath: %016x', datapath.id)
-                del self.datapaths[datapath.id]
+            if dp.id in self.datapaths:
+                del self.datapaths[dp.id]
 
+    # FIXED HANDLER
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
-        """Install proactive rules when switch connects."""
-        datapath = ev.datapath
+        datapath = ev.msg.datapath   # ✅ FIXED
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
         self.logger.info("Configuring switch %d", datapath.id)
 
-        # 1. Default drop rule (lowest priority)
+        # Default DROP rule
         match = parser.OFPMatch()
-        self.add_flow(datapath, priority=0, match=match, actions=[])
+        self.add_flow(datapath, 0, match, [])
 
-        # 2. Allow TCP/UDP between H1/H2/Mgmt and Server
-        # We don't do per-switch output ports here (for simplicity),
-        # we just allow traffic based on IP and protocol and rely on normal L2 learning
-        # if you extend this app. For now, we just "permit" by not dropping.
+        # Allow ARP
+        match_arp = parser.OFPMatch(eth_type=0x0806)
+        self.add_flow(datapath, 50, match_arp,
+                      [parser.OFPActionOutput(ofproto.OFPP_NORMAL)])
 
-        # TCP flows
         allowed_pairs = [
             (H1_IP, SERVER_IP),
             (SERVER_IP, H1_IP),
@@ -72,80 +68,45 @@ class EnterpriseSDN(app_manager.RyuApp):
         for src, dst in allowed_pairs:
             # TCP
             match_tcp = parser.OFPMatch(
-                eth_type=0x0800,
-                ip_proto=6,
-                ipv4_src=src,
-                ipv4_dst=dst
+                eth_type=0x0800, ip_proto=6,
+                ipv4_src=src, ipv4_dst=dst
             )
-            actions = [parser.OFPActionOutput(ofproto.OFPP_NORMAL)]
-            self.add_flow(datapath, priority=100, match=match_tcp, actions=actions)
+            self.add_flow(datapath, 100, match_tcp,
+                          [parser.OFPActionOutput(ofproto.OFPP_NORMAL)])
 
             # UDP
             match_udp = parser.OFPMatch(
-                eth_type=0x0800,
-                ip_proto=17,
-                ipv4_src=src,
-                ipv4_dst=dst
+                eth_type=0x0800, ip_proto=17,
+                ipv4_src=src, ipv4_dst=dst
             )
-            self.add_flow(datapath, priority=100, match=match_udp, actions=actions)
+            self.add_flow(datapath, 100, match_udp,
+                          [parser.OFPActionOutput(ofproto.OFPP_NORMAL)])
 
-        # Optionally, allow ARP so hosts can resolve addresses
-        match_arp = parser.OFPMatch(eth_type=0x0806)
-        actions_arp = [parser.OFPActionOutput(ofproto.OFPP_NORMAL)]
-        self.add_flow(datapath, priority=50, match=match_arp, actions=actions_arp)
-
-    def add_flow(self, datapath, priority, match, actions, buffer_id=None):
+    def add_flow(self, datapath, priority, match, actions):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-
-        if buffer_id:
-            mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
-                                    priority=priority, match=match,
-                                    instructions=inst)
-        else:
-            mod = parser.OFPFlowMod(datapath=datapath,
-                                    priority=priority, match=match,
-                                    instructions=inst)
+        mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
+                                match=match, instructions=inst)
         datapath.send_msg(mod)
 
+    # Monitoring thread
     def _monitor(self):
-        """Periodically poll sw5 for flow stats."""
         while True:
-            for dpid, dp in list(self.datapaths.items()):
+            for dpid, dp in self.datapaths.items():
                 if dpid == SW5_DPID:
                     self._request_stats(dp)
-            hub.sleep(10)  # every 10 seconds
+            hub.sleep(10)
 
     def _request_stats(self, datapath):
-        self.logger.info('Sending stats request to sw5')
-        ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-
         req = parser.OFPFlowStatsRequest(datapath)
         datapath.send_msg(req)
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def flow_stats_reply_handler(self, ev):
-        body = ev.msg.body
         dpid = ev.msg.datapath.id
-
         timestamp = time.time()
 
-        for stat in body:
-            # Only log IP flows (TCP/UDP)
-            if stat.match.get('eth_type') == 0x0800 and stat.match.get('ip_proto') in [6, 17]:
-                match_str = str(stat.match)
-                byte_count = stat.byte_count
-                packet_count = stat.packet_count
-
-                self.logger.info('sw%d flow: %s bytes=%d pkts=%d',
-                                 dpid, match_str, byte_count, packet_count)
-
-                self.csv_writer.writerow([timestamp, dpid, match_str, byte_count, packet_count])
-                self.csv_file.flush()
-
-    def close(self):
-        self.csv_file.close()
-        super(EnterpriseSDN, self).close()
+        for stat in ev.msg.body:
+            if stat.match.get('eth_type') == 0x0800 and stat.match.get('ip_proto')
