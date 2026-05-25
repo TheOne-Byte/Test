@@ -59,10 +59,24 @@ class EnterpriseSDN(app_manager.RyuApp):
         # 1. Provide an absolute fallback for ARP discovery
         self.add_flow(dp, 100, parser.OFPMatch(eth_type=0x0806), [parser.OFPActionOutput(ofp.OFPP_FLOOD)])
 
-        # 2. Add dynamic Packet-In handler rule so switches can discover host ports natively
+        # 2. Part B1 Perimeter Lockdown (PROACTIVE DESIGN DESIGNATION)
+        # Permitting traffic patterns targeting or originating from the core enterprise server
+        # Explicit Layer-4 matches included to ensure fine-grained telemetry tracking
+        
+        # Proactive Rules for ICMP (Proto 1), TCP (Proto 6), and UDP (Proto 17) to/from Server
+        for proto in [1, 6, 17]:
+            # Traffic heading To Server -> High priority forwarding
+            self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_dst=SERVER_IP), [parser.OFPActionOutput(ofp.OFPP_FLOOD)])
+            # Traffic coming From Server -> High priority forwarding
+            self.add_flow(dp, 10, parser.OFPMatch(eth_type=0x0800, ip_proto=proto, ipv4_src=SERVER_IP), [parser.OFPActionOutput(ofp.OFPP_FLOOD)])
+
+        # Proactive Drop Rule: Any other IP traffic that bypasses the Server validation rules is dropped completely
+        self.add_flow(dp, 5, parser.OFPMatch(eth_type=0x0800), [])
+
+        # 3. Add dynamic Packet-In handler rule as an administrative fallback
         self.add_flow(dp, 0, parser.OFPMatch(), [parser.OFPActionOutput(ofp.OFPP_CONTROLLER)])
 
-        # 3. Provision the sub-task B4 rate limiter band on the core switch
+        # 4. Provision the sub-task B4 rate limiter band on the core switch
         if dpid == SW5_DPID:
             self.sw5_dp = dp
             self.add_meter(dp, meter_id=1, rate_kbps=5000)
@@ -87,35 +101,24 @@ class EnterpriseSDN(app_manager.RyuApp):
         self.mac_to_port.setdefault(dpid, {})
         self.mac_to_port[dpid][src] = in_port
 
-        # Part B1 Perimeter Lockdown: If it's IP traffic, strictly enforce Server-Only routing
         _ipv4 = pkt.get_protocol(ipv4.ipv4)
-        if _ipv4:
-            src_ip = _ipv4.src
-            dst_ip = _ipv4.dst
-            
-            # If traffic isn't heading to or coming from the Server, drop it immediately!
-            if dst_ip != SERVER_IP and src_ip != SERVER_IP:
-                self.add_flow(dp, 5, parser.OFPMatch(eth_type=0x0800, ipv4_src=src_ip, ipv4_dst=dst_ip), [])
-                return
 
-        # If we know where the destination MAC is, write a permanent flow rule
+        # Reactive L2 rule processing fallback for non-IP frame routing
         if dst in self.mac_to_port[dpid]:
             out_port = self.mac_to_port[dpid][dst]
             actions = [parser.OFPActionOutput(out_port)]
             
-            # Apply traffic engineering limits to UDP streams crossing sw5
+            # Apply traffic engineering limits specifically to UDP streams crossing sw5
             if dpid == SW5_DPID and _ipv4 and _ipv4.proto == 17:
-                match = parser.OFPMatch(eth_type=0x0800, ipv4_src=_ipv4.src, ipv4_dst=_ipv4.dst)
-                self.add_flow(dp, 10, match, actions, meter_id=1)
+                match = parser.OFPMatch(eth_type=0x0800, ipv4_src=_ipv4.src, ipv4_dst=_ipv4.dst, ip_proto=17)
+                self.add_flow(dp, 12, match, actions, meter_id=1) # Elevated priority to override base rules
             else:
                 match = parser.OFPMatch(eth_dst=dst)
                 self.add_flow(dp, 10, match, actions)
 
-            # Send the current packet out
             out = parser.OFPPacketOut(datapath=dp, buffer_id=msg.buffer_id, in_port=in_port, actions=actions, data=msg.data)
             dp.send_msg(out)
         else:
-            # If we don't know where it is yet, flood it safely to discover it
             actions = [parser.OFPActionOutput(ofp.OFPP_FLOOD)]
             out = parser.OFPPacketOut(datapath=dp, buffer_id=msg.buffer_id, in_port=in_port, actions=actions, data=msg.data)
             dp.send_msg(out)
@@ -133,11 +136,14 @@ class EnterpriseSDN(app_manager.RyuApp):
         with open('sw5_stats.csv', 'a', newline='') as f: 
             writer = csv.writer(f) 
             for stat in ev.msg.body: 
-                # Parse internal rule matches safely
                 match_fields = dict(stat.match.items())
                 
-                # Format a scannable structural description
+                # Format a highly detailed, clean description tracking L3 & L4 metrics
                 match_desc = []
+                if 'ip_proto' in match_fields:
+                    proto_map = {1: 'ICMP', 6: 'TCP', 17: 'UDP'}
+                    p_num = match_fields['ip_proto']
+                    match_desc.append(f"protocol:{proto_map.get(p_num, p_num)}")
                 if 'eth_src' in match_fields: match_desc.append(f"src_mac:{match_fields['eth_src']}")
                 if 'eth_dst' in match_fields: match_desc.append(f"dst_mac:{match_fields['eth_dst']}")
                 if 'ipv4_src' in match_fields: match_desc.append(f"src_ip:{match_fields['ipv4_src']}")
